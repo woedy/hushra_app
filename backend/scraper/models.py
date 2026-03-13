@@ -34,13 +34,23 @@ class HushraCredentials(models.Model):
         return f"UUID {self.uuid[:8]}... ({status})"
 
     @classmethod
-    def get_available_credential(cls, soft_limit=80):
-        """Returns a random active credential that is not rate limited and under the soft request limit."""
+    def restore_ready_credentials(cls):
+        """Re-activate credentials whose cooldown window has passed."""
         now = timezone.now()
-        # Auto-restore credentials whose cooldown has passed
         cls.objects.filter(is_active=False, rate_limit_reset_time__lte=now).update(
             is_active=True, rate_limit_reset_time=None
         )
+
+    @classmethod
+    def has_usable_credentials(cls, soft_limit=80):
+        """True if at least one credential can be scheduled right now."""
+        cls.restore_ready_credentials()
+        return cls.objects.filter(is_active=True, request_count__lt=soft_limit).exists()
+
+    @classmethod
+    def get_available_credential(cls, soft_limit=80):
+        """Returns a random active credential that is not rate limited and under the soft request limit."""
+        cls.restore_ready_credentials()
         return (
             cls.objects.filter(is_active=True, request_count__lt=soft_limit)
             .order_by("?")

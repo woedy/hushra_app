@@ -42,7 +42,11 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
         if not key:
             return Response({"error": "Key required"}, status=400)
         obj, _ = GlobalSetting.objects.get_or_create(key=key)
-        obj.value = str(value).lower()
+        if isinstance(value, bool):
+            normalized = str(value).lower()
+        else:
+            normalized = str(value)
+        obj.value = normalized
         obj.save()
         return Response(GlobalSettingSerializer(obj).data)
 
@@ -62,6 +66,11 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
 
         # Calculate how many A-Z prime slots exist in total for configured states
         total_prime_slots = len(states) * len(axes) * 26
+        total_credentials = HushraCredentials.objects.count()
+        soft_limit = GlobalSetting.get_value('soft_limit', 80)
+        HushraCredentials.restore_ready_credentials()
+        active_credentials = HushraCredentials.objects.filter(is_active=True).count()
+        usable_credentials = HushraCredentials.objects.filter(is_active=True, request_count__lt=soft_limit).count()
 
         return Response({
             'enabled': str(enabled).lower() == 'true',
@@ -74,6 +83,10 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
             'states': states,
             'axes': axes,
             'total_prime_slots': total_prime_slots,
+            'total_credentials': total_credentials,
+            'active_credentials': active_credentials,
+            'usable_credentials': usable_credentials,
+            'credentials_ready': usable_credentials > 0,
         })
 
     @action(detail=False, methods=['post'])
@@ -89,7 +102,15 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Invalid states/axes configuration.'}, status=400)
         if not states:
             return Response({'error': 'States cannot be empty.'}, status=400)
-        result = orchestrate_spider.delay(seed_anyway=True)
+
+        if HushraCredentials.objects.count() == 0:
+            return Response({'error': 'No UUID credentials found. Add UUIDs before starting Auto Run.'}, status=400)
+
+        soft_limit = GlobalSetting.get_value('soft_limit', 80)
+        if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
+            return Response({'error': 'No usable UUID credentials are available right now. Reset the UUID pool or increase soft limit.'}, status=400)
+
+        orchestrate_spider.delay(seed_anyway=True)
         return Response({'message': 'Seeding triggered successfully.'})
 
     @action(detail=False, methods=['post'])
