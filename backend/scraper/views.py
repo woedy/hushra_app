@@ -109,8 +109,10 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
         if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
             return Response({'error': 'No active UUID credentials are available right now. Reset the UUID pool or add new UUIDs.'}, status=400)
 
-        orchestrate_spider.delay(seed_anyway=True)
-        return Response({'message': 'Seeding triggered successfully.'})
+        # Run one orchestration cycle inline so the UI immediately shows seeded jobs/tasks,
+        # then rely on worker execution for background lookup processing.
+        result = orchestrate_spider(seed_anyway=True)
+        return Response({'message': f'Seeding triggered successfully. {result}'})
 
     @action(detail=False, methods=['post'])
     def new_session(self, request):
