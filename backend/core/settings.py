@@ -119,6 +119,14 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
+
+# Task jitter configuration (used by scraper.tasks.execute_ssn_lookup)
+# Keep defaults modest for production safety and make them env-configurable.
+CELERY_MIN_JITTER = float(os.environ.get('CELERY_MIN_JITTER', 0.2))
+CELERY_MAX_JITTER = float(os.environ.get('CELERY_MAX_JITTER', 1.0))
+if CELERY_MAX_JITTER < CELERY_MIN_JITTER:
+    CELERY_MAX_JITTER = CELERY_MIN_JITTER
+
 # Channels Configuration
 CHANNEL_LAYERS = {
     'default': {
@@ -140,4 +148,12 @@ REST_FRAMEWORK = {
 }
 
 # Hushra specific settings
+
+# Scraper tuning knobs
+HUSHRA_TOKEN_CACHE_TTL = int(os.environ.get('HUSHRA_TOKEN_CACHE_TTL', 3600))
+HUSHRA_LASTNAME_DEPTH_THRESHOLD = int(os.environ.get('HUSHRA_LASTNAME_DEPTH_THRESHOLD', 6))
+HUSHRA_LOOKUP_LIMIT_THRESHOLD = int(os.environ.get('HUSHRA_LOOKUP_LIMIT_THRESHOLD', 50))
+HUSHRA_NO_CREDENTIAL_RETRY_SECONDS = int(os.environ.get('HUSHRA_NO_CREDENTIAL_RETRY_SECONDS', 300))
+HUSHRA_AUTH_FAILED_RETRY_SECONDS = int(os.environ.get('HUSHRA_AUTH_FAILED_RETRY_SECONDS', 10))
+HUSHRA_RATE_LIMIT_RETRY_SECONDS = int(os.environ.get('HUSHRA_RATE_LIMIT_RETRY_SECONDS', 300))
 HUSHRA_CREDENTIAL_SOFT_LIMIT = int(os.environ.get('HUSHRA_CREDENTIAL_SOFT_LIMIT', 80))

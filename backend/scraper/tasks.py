@@ -15,10 +15,10 @@ from .hushra_client import HushraAPIClient
 
 logger = logging.getLogger(__name__)
 
-TOKEN_CACHE_TTL = 3600  # Token cached for 1 hour in Redis
+TOKEN_CACHE_TTL = getattr(settings, "HUSHRA_TOKEN_CACHE_TTL", 3600)
 
 # The depth at which a lastname axis switches to firstname axis for finer drilling
-LASTNAME_DEPTH_THRESHOLD = 6
+LASTNAME_DEPTH_THRESHOLD = getattr(settings, "HUSHRA_LASTNAME_DEPTH_THRESHOLD", 6)
 
 # Alphabet for prefix expansion
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
@@ -154,7 +154,7 @@ def _spawn_children(task, axis, base_prefix, prefix_field, extra_fields=None):
 
         new_task = SearchTask.objects.create(**create_kwargs)
         # Use on_commit to ensure the task isn't picked up before the DB has it
-        transaction.on_commit(lambda: execute_ssn_lookup.delay(new_task.id))
+        transaction.on_commit(lambda task_id=new_task.id: execute_ssn_lookup.delay(task_id))
         new_task.celery_task_id = "PENDING_COMMIT"
         new_task.save(update_fields=['celery_task_id'])
         spawned += 1
@@ -193,9 +193,20 @@ def execute_ssn_lookup(self, task_id):
             task.save(update_fields=['status'])
         return
 
-    # 1. Mark in progress
+    # 1. Claim task atomically so duplicate deliveries don't re-run the same row
+    claimed = SearchTask.objects.filter(id=task.id, status='PENDING').update(
+        status='IN_PROGRESS',
+        updated_at=timezone.now(),
+    )
+    if claimed == 0:
+        logger.info(f"Task {task_id} skipped because status is already {task.status}.")
+        return
     task.status = 'IN_PROGRESS'
-    task.save(update_fields=['status', 'updated_at'])
+
+    def _requeue_task(countdown):
+        task.status = 'PENDING'
+        task.save(update_fields=['status', 'updated_at'])
+        raise self.retry(countdown=countdown)
 
     # 2. Jitter to avoid stampeding requests
     delay = random.uniform(settings.CELERY_MIN_JITTER, settings.CELERY_MAX_JITTER)
@@ -207,9 +218,7 @@ def execute_ssn_lookup(self, task_id):
     credential = HushraCredentials.get_available_credential(soft_limit=soft_limit)
     if not credential:
         logger.warning("No active Hushra credentials available. Retrying in 5 min.")
-        task.status = 'PENDING'
-        task.save(update_fields=['status'])
-        raise self.retry(countdown=300)
+        _requeue_task(getattr(settings, "HUSHRA_NO_CREDENTIAL_RETRY_SECONDS", 300))
 
     # 4. Get authenticated client (with token caching & failover)
     cache_key = f"hushra_token_{credential.id}"
@@ -220,16 +229,17 @@ def execute_ssn_lookup(self, task_id):
             logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}... Marking exhausted.")
             cache.delete(cache_key)
             credential.mark_rate_limited(hours=24)
-            raise self.retry(countdown=10)
+            _requeue_task(getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10))
         elif login_err == "RATE_LIMITED":
             logger.warning(f"RATE_LIMITED during login for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
             credential.mark_rate_limited(hours=1)
-            raise self.retry(countdown=300)
+            _requeue_task(getattr(settings, "HUSHRA_RATE_LIMIT_RETRY_SECONDS", 300))
         else:
             logger.warning(f"System error ({login_err}) during login for UUID {credential.uuid[:8]}... Retrying.")
             cache.delete(cache_key)
-            raise self.retry(countdown=min(300, (2 ** self.request.retries) * 30))
+            backoff_cap = getattr(settings, "HUSHRA_RATE_LIMIT_RETRY_SECONDS", 300)
+            _requeue_task(min(backoff_cap, (2 ** self.request.retries) * 30))
 
     # 5. Increment the soft usage counter
     credential.increment_request_count()
@@ -267,7 +277,7 @@ def execute_ssn_lookup(self, task_id):
                 )
         # ─────────────────────────────────────────────────────────────────────
 
-        LIMIT_THRESHOLD = 50
+        LIMIT_THRESHOLD = getattr(settings, "HUSHRA_LOOKUP_LIMIT_THRESHOLD", 50)
 
         if len(results) >= LIMIT_THRESHOLD:
             # Result set was truncated — need to go deeper
@@ -367,8 +377,9 @@ def execute_ssn_lookup(self, task_id):
             logger.warning(f"Credential {credential.uuid[:8]}... hit rate limit (429).")
             cache.delete(cache_key)
             credential.mark_rate_limited(hours=1)
-            countdown = min(300, (2 ** self.request.retries) * 10)
-            raise self.retry(countdown=countdown)
+            rate_cap = getattr(settings, "HUSHRA_RATE_LIMIT_RETRY_SECONDS", 300)
+            countdown = min(rate_cap, (2 ** self.request.retries) * 10)
+            _requeue_task(countdown)
         else:
             task.status = 'FAILED'
             task.error_message = f"HTTP Error: {e}"
@@ -493,6 +504,13 @@ def orchestrate_spider(seed_anyway=False):
         if not states or not axes:
             return "Invalid states or axes configuration."
 
+        if HushraCredentials.objects.count() == 0:
+            return "No UUID credentials configured. Add UUIDs before running Auto Run."
+
+        soft_limit = GlobalSetting.get_value('soft_limit', 80)
+        if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
+            return "No usable UUID credentials available. Reset UUID pool or increase soft limit."
+
         # Use a persistent Job for Auto Orchestration to group them
         job, _ = SearchJob.objects.get_or_create(name="Auto Orchestrator Job", defaults={'status': 'RUNNING'})
         if job.status == 'STOPPED':
@@ -501,9 +519,26 @@ def orchestrate_spider(seed_anyway=False):
             job.save(update_fields=['status'])
 
         seeded = 0
+        state_runs = {}
 
         # We iterate over states and axes, looking for A-Z primes that don't exist yet
         for state in states:
+            normalized_state = state.upper()
+            state_run, _ = StateRun.objects.get_or_create(
+                job=job,
+                state=normalized_state,
+                defaults={
+                    'status': 'RUNNING',
+                    'axes_enabled': axes,
+                },
+            )
+            if state_run.status in ['COMPLETED', 'FAILED']:
+                state_run.status = 'RUNNING'
+            state_run.axes_enabled = axes
+            state_run.started_at = state_run.started_at or timezone.now()
+            state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
+            state_runs[normalized_state] = state_run
+
             for axis in axes:
                 for letter in ALPHABET:
                     if seeded >= to_seed:
@@ -513,7 +548,7 @@ def orchestrate_spider(seed_anyway=False):
                     # Prime tasks have firstname='', lastname=letter (for lastname axis) or city=letter (for city axis)
                     filter_kwargs = {
                         'axis': axis,
-                        'state': state.upper()
+                        'state': normalized_state
                     }
                     if axis == 'lastname':
                         filter_kwargs['lastname'] = letter
@@ -545,6 +580,7 @@ def orchestrate_spider(seed_anyway=False):
                         create_kwargs = filter_kwargs.copy()
                         create_kwargs['job'] = job
                         create_kwargs['status'] = 'PENDING'
+                        create_kwargs['state_run'] = state_runs[normalized_state]
 
                         if 'firstname' not in create_kwargs: create_kwargs['firstname'] = ''
                         if 'lastname' not in create_kwargs: create_kwargs['lastname'] = ''
@@ -553,7 +589,7 @@ def orchestrate_spider(seed_anyway=False):
                         task = SearchTask.objects.create(**create_kwargs)
                         logger.info(f"Orchestrator: CREATED Task {task.id} for {filter_kwargs}")
                         # Use on_commit to ensure the worker doesn't start until the row is persistent
-                        transaction.on_commit(lambda: execute_ssn_lookup.delay(task.id))
+                        transaction.on_commit(lambda task_id=task.id: execute_ssn_lookup.delay(task_id))
                         task.celery_task_id = "PENDING_COMMIT"
                         task.save(update_fields=['celery_task_id'])
                         seeded += 1
@@ -563,9 +599,11 @@ def orchestrate_spider(seed_anyway=False):
             if seeded >= to_seed:
                 break
 
+        for state_run in state_runs.values():
+            state_run.update_metrics()
+
         return f"Orchestrator: Queued {seeded} new prime tasks across {len(states)} states."
 
     finally:
         # Release the lock
         cache.delete(lock_id)
-

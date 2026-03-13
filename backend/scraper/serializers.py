@@ -86,3 +86,19 @@ class SearchJobSerializer(serializers.ModelSerializer):
                 return 'COMPLETED'
                 
         return obj.status
+
+
+class StateRunSerializer(serializers.ModelSerializer):
+    progress_percentage = serializers.FloatField(read_only=True)
+
+    class Meta:
+        model = StateRun
+        fields = [
+            'id', 'job', 'state', 'status', 'priority',
+            'axes_enabled', 'max_concurrent_tasks', 'min_queue_depth',
+            'total_primes', 'primes_completed', 'total_tasks',
+            'tasks_pending', 'tasks_in_progress', 'tasks_completed', 'tasks_failed',
+            'total_records', 'avg_task_duration', 'tasks_per_minute',
+            'records_per_task', 'duplicate_rate', 'started_at', 'completed_at',
+            'estimated_completion', 'created_at', 'updated_at', 'progress_percentage'
+        ]
