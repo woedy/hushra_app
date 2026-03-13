@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -107,6 +107,9 @@ export default function Dashboard() {
   const [jobs, setJobs] = useState([]);
   const [activeTasks, setActiveTasks] = useState([]);
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
+  const [stateRuns, setStateRuns] = useState([]);
+  const [isLoadingStateRuns, setIsLoadingStateRuns] = useState(false);
+  const [stateRunActionId, setStateRunActionId] = useState(null);
 
   // ── accounts tab ──────────────────────────────────────────────────────
   const [credentials, setCredentials] = useState([]);
@@ -177,6 +180,21 @@ export default function Dashboard() {
     } catch {}
   }, []);
 
+  const fetchStateRuns = useCallback(async () => {
+    setIsLoadingStateRuns(true);
+    try {
+      const r = await apiFetch('/api/state-runs/?ordering=-updated_at');
+      if (r.ok) {
+        const data = await r.json();
+        setStateRuns(data.results || data);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoadingStateRuns(false);
+    }
+  }, []);
+
   const fetchStats = useCallback(async () => {
     try {
       const r = await apiFetch('/api/stats/');
@@ -207,9 +225,13 @@ export default function Dashboard() {
   useEffect(() => {
     if (activeTab !== 'orchestrator') return;
     fetchOrchestratorStatus();
-    const id = setInterval(fetchOrchestratorStatus, 5000);
+    fetchStateRuns();
+    const id = setInterval(() => {
+      fetchOrchestratorStatus();
+      fetchStateRuns();
+    }, 5000);
     return () => clearInterval(id);
-  }, [activeTab, fetchOrchestratorStatus]);
+  }, [activeTab, fetchOrchestratorStatus, fetchStateRuns]);
 
   // ── job & active task fetcher ─────────────────────────────────────────
   const fetchJobsData = useCallback(async () => {
@@ -504,6 +526,18 @@ export default function Dashboard() {
     setIsSubmitting(false);
   };
 
+  const handleStateRunAction = async (id, action) => {
+    setStateRunActionId(id);
+    try {
+      await apiFetch(`/api/state-runs/${id}/${action}/`, { method: 'POST' });
+      await Promise.all([fetchStateRuns(), fetchOrchestratorStatus()]);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setStateRunActionId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -659,6 +693,58 @@ export default function Dashboard() {
                   </div>
                 )}
 
+                {/* STATE RUN MONITOR */}
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">State Runs</p>
+                    <button onClick={fetchStateRuns} className="text-[10px] text-blue-400 hover:text-blue-300">⟳ Refresh</button>
+                  </div>
+
+                  {isLoadingStateRuns && <p className="text-xs text-gray-500">Loading state runs...</p>}
+                  {!isLoadingStateRuns && stateRuns.length === 0 && (
+                    <p className="text-xs text-gray-500">No state runs yet. Save config and seed to start tracking per-state progress.</p>
+                  )}
+
+                  <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
+                    {stateRuns.slice(0, 12).map(sr => {
+                      const done = sr.total_primes > 0
+                        ? Math.min((sr.primes_completed / sr.total_primes) * 100, 100)
+                        : 0;
+                      const actionBusy = stateRunActionId === sr.id;
+                      return (
+                        <div key={sr.id} className="border border-gray-700 rounded-lg p-2 bg-gray-800/60 space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-mono font-bold text-white">{sr.state}</span>
+                              <StatusBadge status={sr.status} />
+                            </div>
+                            <div className="text-[10px] text-gray-500 font-mono">
+                              {sr.tasks_completed}/{sr.total_tasks || 0} tasks
+                            </div>
+                          </div>
+                          <div className="w-full h-1.5 rounded-full bg-gray-900 overflow-hidden">
+                            <div className="h-full bg-blue-500 transition-all" style={{ width: `${done}%` }} />
+                          </div>
+                          <div className="flex items-center justify-between text-[10px] text-gray-500 font-mono">
+                            <span>Primes {sr.primes_completed}/{sr.total_primes || 0}</span>
+                            <span>{Math.round(done)}%</span>
+                          </div>
+                          <div className="flex gap-1">
+                            <button disabled={actionBusy || sr.status !== 'RUNNING'} onClick={() => handleStateRunAction(sr.id, 'pause')}
+                              className="px-2 py-1 text-[10px] rounded border border-amber-500/30 text-amber-300 disabled:opacity-40">Pause</button>
+                            <button disabled={actionBusy || sr.status !== 'PAUSED'} onClick={() => handleStateRunAction(sr.id, 'resume')}
+                              className="px-2 py-1 text-[10px] rounded border border-blue-500/30 text-blue-300 disabled:opacity-40">Resume</button>
+                            <button disabled={actionBusy || ['COMPLETED', 'FAILED'].includes(sr.status)} onClick={() => handleStateRunAction(sr.id, 'stop')}
+                              className="px-2 py-1 text-[10px] rounded border border-red-500/30 text-red-300 disabled:opacity-40">Stop</button>
+                            <button disabled={actionBusy} onClick={() => handleStateRunAction(sr.id, 'refresh_metrics')}
+                              className="ml-auto px-2 py-1 text-[10px] rounded border border-gray-600 text-gray-300 disabled:opacity-40">Metrics</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {/* CONFIGURATION */}
                 <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 space-y-3 overflow-y-auto custom-scrollbar flex-1">
                   <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Configuration</p>
@@ -695,7 +781,7 @@ export default function Dashboard() {
                               isSelected 
                                 ? 'bg-blue-500/20 border-blue-500 text-blue-300' 
                                 : 'bg-gray-800 border-gray-700 text-gray-500 hover:border-gray-600'
-                            }`}>
+                            } ${isLive ? 'ring-1 ring-emerald-500/50' : ''}`}>
                             {st}
                           </button>
                         );
