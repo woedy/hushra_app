@@ -62,6 +62,8 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
 
         # Calculate how many A-Z prime slots exist in total for configured states
         total_prime_slots = len(states) * len(axes) * 26
+        total_credentials = HushraCredentials.objects.count()
+        active_credentials = HushraCredentials.objects.filter(is_active=True).count()
 
         return Response({
             'enabled': str(enabled).lower() == 'true',
@@ -74,6 +76,9 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
             'states': states,
             'axes': axes,
             'total_prime_slots': total_prime_slots,
+            'total_credentials': total_credentials,
+            'active_credentials': active_credentials,
+            'credentials_ready': total_credentials > 0 and active_credentials > 0,
         })
 
     @action(detail=False, methods=['post'])
@@ -89,7 +94,14 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Invalid states/axes configuration.'}, status=400)
         if not states:
             return Response({'error': 'States cannot be empty.'}, status=400)
-        result = orchestrate_spider.delay(seed_anyway=True)
+
+        if HushraCredentials.objects.count() == 0:
+            return Response({'error': 'No UUID credentials found. Add UUIDs before starting Auto Run.'}, status=400)
+
+        if not HushraCredentials.objects.filter(is_active=True).exists():
+            return Response({'error': 'All UUID credentials are exhausted. Reset or add active UUIDs before starting.'}, status=400)
+
+        orchestrate_spider.delay(seed_anyway=True)
         return Response({'message': 'Seeding triggered successfully.'})
 
     @action(detail=False, methods=['post'])
