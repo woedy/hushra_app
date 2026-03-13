@@ -1,0 +1,88 @@
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=hushra_db
+      - POSTGRES_USER=hushra_user
+      - POSTGRES_PASSWORD=hushra_pass
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    command: sh -c "python manage.py collectstatic --noinput && daphne -b 0.0.0.0 -p 8000 core.asgi:application"
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgres://hushra_user:hushra_pass@db:5432/hushra_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - HUSHRA_CREDENTIAL_SOFT_LIMIT=80
+    depends_on:
+      - db
+      - redis
+
+  celery:
+    build: ./backend
+    command: celery -A core worker -l info --concurrency=4
+    volumes:
+      - ./backend:/app
+    environment:
+      - DATABASE_URL=postgres://hushra_user:hushra_pass@db:5432/hushra_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - HUSHRA_CREDENTIAL_SOFT_LIMIT=80
+    depends_on:
+      - db
+      - redis
+      - backend
+
+  celery-beat:
+    build: ./backend
+    command: celery -A core beat -l info
+    volumes:
+      - ./backend:/app
+    environment:
+      - DATABASE_URL=postgres://hushra_user:hushra_pass@db:5432/hushra_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+      - backend
+
+  flower:
+    build: ./backend
+    command: celery -A core flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - DATABASE_URL=postgres://hushra_user:hushra_pass@db:5432/hushra_db
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  frontend:
+    build: ./frontend
+    command: npm run dev -- --host 0.0.0.0
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+
+volumes:
+  postgres_data:
+

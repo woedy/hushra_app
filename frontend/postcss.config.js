@@ -1,0 +1,1 @@
+/* Delete postcss.config.js because we configured it in vite.config.js */

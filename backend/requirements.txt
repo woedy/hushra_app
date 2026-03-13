@@ -1,0 +1,15 @@
+django
+djangorestframework
+celery
+celery[redis]
+flower
+redis
+psycopg2-binary
+django-cors-headers
+channels
+daphne
+channels-redis
+requests
+django-filter
+dj-database-url
+whitenoise
