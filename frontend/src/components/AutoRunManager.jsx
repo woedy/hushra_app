@@ -20,18 +20,6 @@ function Badge({ status }) {
   };
 
 
-  const resetUuidPool = async () => {
-    setBusy(true);
-    try {
-      const r = await apiFetch('/api/credentials/reset_pool/', { method: 'POST' });
-      const d = await r.json();
-      setLastMsg(d.message || d.error || 'UUID pool reset complete.');
-      await refreshAll();
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <span className={`text-[10px] px-2 py-0.5 rounded-full border font-semibold ${map[status] || map.PENDING}`}>
       {status}
@@ -51,7 +39,11 @@ export default function AutoRunManager() {
   const [stateRunBusy, setStateRunBusy] = useState(null);
   const [uuidBlob, setUuidBlob] = useState('');
 
-  const credentialsReady = status?.credentials_ready;
+  const activeUuidCount = useMemo(() => credentials.filter(c => c.is_active).length, [credentials]);
+
+
+  const hasLoadedStatus = status !== null;
+  const credentialsReady = status?.credentials_ready ?? activeUuidCount > 0;
 
   const loadSettings = useCallback(async () => {
     const r = await apiFetch('/api/settings/');
@@ -101,7 +93,6 @@ export default function AutoRunManager() {
     return () => clearInterval(id);
   }, [refreshAll, refreshLive]);
 
-  const activeUuidCount = useMemo(() => credentials.filter(c => c.is_active).length, [credentials]);
 
   const sortedSelectedStates = useMemo(() => [...autoStates].sort(), [autoStates]);
 
@@ -127,13 +118,17 @@ export default function AutoRunManager() {
     return { ...totals, avgTpm, avgRpt, primeProgress };
   }, [stateRuns]);
 
+  const persistConfig = useCallback(async () => {
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_queue_min', value: autoQueueMin }) });
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_states', value: autoStates.join(',') }) });
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_axes', value: autoAxes.join(',') }) });
+  }, [autoAxes, autoQueueMin, autoStates]);
+
   const saveConfig = async () => {
     setBusy(true);
     setLastMsg('');
     try {
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_queue_min', value: autoQueueMin }) });
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_states', value: autoStates.join(',') }) });
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_axes', value: autoAxes.join(',') }) });
+      await persistConfig();
       setLastMsg('Configuration saved.');
       await refreshAll();
     } finally {
@@ -150,6 +145,7 @@ export default function AutoRunManager() {
     setBusy(true);
     setLastMsg('');
     try {
+      await persistConfig();
       const r = await apiFetch('/api/settings/toggle/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_enabled' }) });
       const d = await r.json();
       const nowEnabled = d.value === true || d.value === 'true';
@@ -171,6 +167,7 @@ export default function AutoRunManager() {
     }
     setBusy(true);
     try {
+      await persistConfig();
       const r = await apiFetch('/api/settings/seed_now/', { method: 'POST' });
       const d = await r.json();
       setLastMsg(r.ok ? d.message : (d.error || 'Seed failed.'));
@@ -235,7 +232,7 @@ export default function AutoRunManager() {
 
   return (
     <div className="space-y-6">
-      {!credentialsReady && (
+      {hasLoadedStatus && !credentialsReady && (
         <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4">
           <p className="text-sm font-bold text-red-300">Auto Run is blocked</p>
           <p className="text-xs text-red-200/90 mt-1">You need at least one active UUID credential before Auto Run tasks can start. If UUIDs are exhausted, use Reset UUID Pool below.</p>
@@ -387,20 +384,8 @@ export default function AutoRunManager() {
             {stateRuns.map(sr => {
               const progress = sr.total_primes > 0 ? Math.min((sr.primes_completed / sr.total_primes) * 100, 100) : 0;
               const busyRow = stateRunBusy === sr.id;
-            
-  const resetUuidPool = async () => {
-    setBusy(true);
-    try {
-      const r = await apiFetch('/api/credentials/reset_pool/', { method: 'POST' });
-      const d = await r.json();
-      setLastMsg(d.message || d.error || 'UUID pool reset complete.');
-      await refreshAll();
-    } finally {
-      setBusy(false);
-    }
-  };
 
-  return (
+              return (
                 <div key={sr.id} className="bg-gray-900 border border-gray-700 rounded-lg p-3 space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2"><span className="font-mono font-bold">{sr.state}</span><Badge status={sr.status} /></div>
