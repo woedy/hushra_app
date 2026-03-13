@@ -501,9 +501,26 @@ def orchestrate_spider(seed_anyway=False):
             job.save(update_fields=['status'])
 
         seeded = 0
+        state_runs = {}
 
         # We iterate over states and axes, looking for A-Z primes that don't exist yet
         for state in states:
+            normalized_state = state.upper()
+            state_run, _ = StateRun.objects.get_or_create(
+                job=job,
+                state=normalized_state,
+                defaults={
+                    'status': 'RUNNING',
+                    'axes_enabled': axes,
+                },
+            )
+            if state_run.status in ['COMPLETED', 'FAILED']:
+                state_run.status = 'RUNNING'
+            state_run.axes_enabled = axes
+            state_run.started_at = state_run.started_at or timezone.now()
+            state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
+            state_runs[normalized_state] = state_run
+
             for axis in axes:
                 for letter in ALPHABET:
                     if seeded >= to_seed:
@@ -513,7 +530,7 @@ def orchestrate_spider(seed_anyway=False):
                     # Prime tasks have firstname='', lastname=letter (for lastname axis) or city=letter (for city axis)
                     filter_kwargs = {
                         'axis': axis,
-                        'state': state.upper()
+                        'state': normalized_state
                     }
                     if axis == 'lastname':
                         filter_kwargs['lastname'] = letter
@@ -545,6 +562,7 @@ def orchestrate_spider(seed_anyway=False):
                         create_kwargs = filter_kwargs.copy()
                         create_kwargs['job'] = job
                         create_kwargs['status'] = 'PENDING'
+                        create_kwargs['state_run'] = state_runs[normalized_state]
 
                         if 'firstname' not in create_kwargs: create_kwargs['firstname'] = ''
                         if 'lastname' not in create_kwargs: create_kwargs['lastname'] = ''
@@ -563,9 +581,11 @@ def orchestrate_spider(seed_anyway=False):
             if seeded >= to_seed:
                 break
 
+        for state_run in state_runs.values():
+            state_run.update_metrics()
+
         return f"Orchestrator: Queued {seeded} new prime tasks across {len(states)} states."
 
     finally:
         # Release the lock
         cache.delete(lock_id)
-
