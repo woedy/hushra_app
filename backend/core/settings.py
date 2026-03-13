@@ -119,6 +119,14 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
+
+# Task jitter configuration (used by scraper.tasks.execute_ssn_lookup)
+# Keep defaults modest for production safety and make them env-configurable.
+CELERY_MIN_JITTER = float(os.environ.get('CELERY_MIN_JITTER', 0.2))
+CELERY_MAX_JITTER = float(os.environ.get('CELERY_MAX_JITTER', 1.0))
+if CELERY_MAX_JITTER < CELERY_MIN_JITTER:
+    CELERY_MAX_JITTER = CELERY_MIN_JITTER
+
 # Channels Configuration
 CHANNEL_LAYERS = {
     'default': {
