@@ -34,18 +34,31 @@ class HushraCredentials(models.Model):
         return f"UUID {self.uuid[:8]}... ({status})"
 
     @classmethod
-    def get_available_credential(cls, soft_limit=80):
-        """Returns a random active credential that is not rate limited and under the soft request limit."""
+    def restore_ready_credentials(cls):
+        """Re-activate credentials whose cooldown window has passed."""
         now = timezone.now()
-        # Auto-restore credentials whose cooldown has passed
         cls.objects.filter(is_active=False, rate_limit_reset_time__lte=now).update(
             is_active=True, rate_limit_reset_time=None
         )
-        return (
-            cls.objects.filter(is_active=True, request_count__lt=soft_limit)
-            .order_by("?")
-            .first()
-        )
+
+    @classmethod
+    def has_usable_credentials(cls, soft_limit=80):
+        """True if at least one active credential can be scheduled right now."""
+        cls.restore_ready_credentials()
+        return cls.objects.filter(is_active=True).exists()
+
+    @classmethod
+    def get_available_credential(cls, soft_limit=80):
+        """Returns a random active credential, preferring ones under soft request limit."""
+        cls.restore_ready_credentials()
+
+        preferred = cls.objects.filter(is_active=True, request_count__lt=soft_limit).order_by("?").first()
+        if preferred:
+            return preferred
+
+        # Soft limit is advisory; if all active credentials exceeded it,
+        # still return an active credential so work can continue.
+        return cls.objects.filter(is_active=True).order_by("?").first()
 
     def mark_rate_limited(self, hours=1):
         """Mark this credential as temporarily blocked."""
