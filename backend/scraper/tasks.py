@@ -193,6 +193,15 @@ def execute_ssn_lookup(self, task_id):
             task.save(update_fields=['status'])
         return
 
+    # Respect per-state run controls as a hard gate.
+    if task.state_run and task.state_run.status in ['PAUSED', 'FAILED', 'COMPLETED']:
+        logger.info(
+            f"Task {task_id} blocked because state_run={task.state_run_id} is {task.state_run.status}."
+        )
+        task.status = 'STOPPED'
+        task.save(update_fields=['status', 'updated_at'])
+        return
+
     # 1. Claim task atomically so duplicate deliveries don't re-run the same row
     claimed = SearchTask.objects.filter(id=task.id, status='PENDING').update(
         status='IN_PROGRESS',
@@ -207,6 +216,20 @@ def execute_ssn_lookup(self, task_id):
     delay = random.uniform(settings.CELERY_MIN_JITTER, settings.CELERY_MAX_JITTER)
     logger.info(f"Task {task_id} [{task.axis}] sleeping {delay:.2f}s jitter.")
     time.sleep(delay)
+
+    # Re-check stop/pause flags after jitter before any network call.
+    task.refresh_from_db(fields=['status', 'state_run_id', 'job_id'])
+    if task.status == 'STOPPED' or task.job.status == 'STOPPED':
+        logger.info(f"Task {task_id} stopped during jitter phase.")
+        if task.status != 'STOPPED':
+            task.status = 'STOPPED'
+            task.save(update_fields=['status', 'updated_at'])
+        return
+    if task.state_run and task.state_run.status in ['PAUSED', 'FAILED', 'COMPLETED']:
+        logger.info(f"Task {task_id} halted because state_run moved to {task.state_run.status}.")
+        task.status = 'STOPPED'
+        task.save(update_fields=['status', 'updated_at'])
+        return
 
     # 3. Pull a healthy credential (under dynamic soft request limit)
     soft_limit = GlobalSetting.get_value('soft_limit', 80)
@@ -223,10 +246,17 @@ def execute_ssn_lookup(self, task_id):
 
     if client is None:
         if login_err == "AUTH_FAILED":
-            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}... Marking exhausted.")
+            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
-            credential.mark_rate_limited(hours=24)
-            raise self.retry(countdown=getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10))
+            auth_retry_delay = getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10)
+            # Avoid disabling a UUID on the first auth blip; only cool it down after repeated failures.
+            if self.request.retries >= 2:
+                auth_cooldown = getattr(settings, "HUSHRA_AUTH_FAILED_COOLDOWN_HOURS", 2)
+                credential.mark_rate_limited(hours=auth_cooldown)
+                logger.error(
+                    f"AUTH_FAILED repeated for UUID {credential.uuid[:8]}... applying cooldown for {auth_cooldown}h"
+                )
+            raise self.retry(countdown=auth_retry_delay)
         elif login_err == "RATE_LIMITED":
             logger.warning(f"RATE_LIMITED during login for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
@@ -529,8 +559,21 @@ def orchestrate_spider(seed_anyway=False):
                     'axes_enabled': axes,
                 },
             )
-            if state_run.status in ['COMPLETED', 'FAILED']:
-                state_run.status = 'RUNNING'
+            # Respect explicit pause/stop controls for each state run.
+            if state_run.status in ['PAUSED', 'FAILED']:
+                logger.info(
+                    f"Orchestrator: skipping state {normalized_state} because state_run={state_run.id} is {state_run.status}."
+                )
+                continue
+
+            # Allow completed states to be resumed only by setting them RUNNING explicitly.
+            if state_run.status == 'COMPLETED':
+                logger.info(
+                    f"Orchestrator: state {normalized_state} already completed (state_run={state_run.id}), skipping reseed."
+                )
+                continue
+
+            state_run.status = 'RUNNING'
             state_run.axes_enabled = axes
             state_run.started_at = state_run.started_at or timezone.now()
             state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
