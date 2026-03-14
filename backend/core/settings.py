@@ -118,6 +118,12 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    'orchestrate-spider-every-minute': {
+        'task': 'scraper.tasks.orchestrate_spider',
+        'schedule': 60.0,
+    },
+}
 
 
 # Task jitter configuration (used by scraper.tasks.execute_ssn_lookup)
@@ -157,3 +163,4 @@ HUSHRA_NO_CREDENTIAL_RETRY_SECONDS = int(os.environ.get('HUSHRA_NO_CREDENTIAL_RE
 HUSHRA_AUTH_FAILED_RETRY_SECONDS = int(os.environ.get('HUSHRA_AUTH_FAILED_RETRY_SECONDS', 10))
 HUSHRA_RATE_LIMIT_RETRY_SECONDS = int(os.environ.get('HUSHRA_RATE_LIMIT_RETRY_SECONDS', 300))
 HUSHRA_CREDENTIAL_SOFT_LIMIT = int(os.environ.get('HUSHRA_CREDENTIAL_SOFT_LIMIT', 80))
+HUSHRA_AUTH_FAILED_COOLDOWN_HOURS = int(os.environ.get('HUSHRA_AUTH_FAILED_COOLDOWN_HOURS', 2))

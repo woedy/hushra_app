@@ -223,10 +223,17 @@ def execute_ssn_lookup(self, task_id):
 
     if client is None:
         if login_err == "AUTH_FAILED":
-            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}... Marking exhausted.")
+            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
-            credential.mark_rate_limited(hours=24)
-            raise self.retry(countdown=getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10))
+            auth_retry_delay = getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10)
+            # Avoid disabling a UUID on the first auth blip; only cool it down after repeated failures.
+            if self.request.retries >= 2:
+                auth_cooldown = getattr(settings, "HUSHRA_AUTH_FAILED_COOLDOWN_HOURS", 2)
+                credential.mark_rate_limited(hours=auth_cooldown)
+                logger.error(
+                    f"AUTH_FAILED repeated for UUID {credential.uuid[:8]}... applying cooldown for {auth_cooldown}h"
+                )
+            raise self.retry(countdown=auth_retry_delay)
         elif login_err == "RATE_LIMITED":
             logger.warning(f"RATE_LIMITED during login for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)

@@ -109,8 +109,10 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
         if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
             return Response({'error': 'No active UUID credentials are available right now. Reset the UUID pool or add new UUIDs.'}, status=400)
 
-        orchestrate_spider.delay(seed_anyway=True)
-        return Response({'message': 'Seeding triggered successfully.'})
+        # Run one orchestration cycle inline so the UI immediately shows seeded jobs/tasks,
+        # then rely on worker execution for background lookup processing.
+        result = orchestrate_spider(seed_anyway=True)
+        return Response({'message': f'Seeding triggered successfully. {result}'})
 
     @action(detail=False, methods=['post'])
     def new_session(self, request):
@@ -138,6 +140,129 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
             return Response({'message': f'New session started. Cleared {deleted_count} tasks and purged the queue.', 'deleted': deleted_count})
         except SearchJob.DoesNotExist:
             return Response({'message': 'No existing auto-orchestrator job. Ready for first run.', 'deleted': 0})
+
+    @action(detail=False, methods=['post'])
+    def smoke_test(self, request):
+        """
+        Minimal manual pipeline: seed a small deterministic batch (default 5)
+        for one state/axis and enqueue workers immediately.
+        Payload (optional): {"state": "CA", "axis": "lastname", "count": 5, "clear_existing": true}
+        """
+        axis = str(request.data.get('axis', 'lastname')).strip().lower()
+        if axis not in {'lastname', 'firstname', 'city'}:
+            return Response({'error': 'axis must be one of lastname, firstname, city'}, status=400)
+
+        raw_count = request.data.get('count', 5)
+        try:
+            count = max(1, min(int(raw_count), 26))
+        except (TypeError, ValueError):
+            return Response({'error': 'count must be an integer between 1 and 26'}, status=400)
+
+        clear_existing = str(request.data.get('clear_existing', 'true')).lower() != 'false'
+
+        state = str(request.data.get('state', '')).strip().upper()
+        if not state:
+            configured_states = GlobalSetting.get_value('auto_run_states', default='')
+            if configured_states:
+                parts = [s.strip().upper() for s in str(configured_states).split(',') if s.strip()]
+                state = parts[0] if parts else ''
+        if not state or len(state) != 2:
+            return Response({'error': 'Provide a valid 2-letter state code.'}, status=400)
+
+        if HushraCredentials.objects.count() == 0:
+            return Response({'error': 'No UUID credentials found. Add UUIDs first.'}, status=400)
+
+        HushraCredentials.restore_ready_credentials()
+        if not HushraCredentials.objects.filter(is_active=True).exists():
+            return Response({'error': 'No active UUID credentials are available. Reset UUID pool first.'}, status=400)
+
+        alphabet = 'abcdefghijklmnopqrstuvwxyz'
+        letters = alphabet[:count]
+
+        job, _ = SearchJob.objects.get_or_create(name='Smoke Test Job', defaults={'status': 'RUNNING'})
+        if job.status == 'STOPPED':
+            job.status = 'RUNNING'
+            job.save(update_fields=['status'])
+
+        state_run, _ = StateRun.objects.get_or_create(
+            job=job,
+            state=state,
+            defaults={'status': 'RUNNING', 'axes_enabled': [axis]},
+        )
+        state_run.status = 'RUNNING'
+        state_run.axes_enabled = [axis]
+        state_run.started_at = state_run.started_at or timezone.now()
+        state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
+
+        deleted = 0
+        if clear_existing:
+            deleted, _ = state_run.tasks.filter(status__in=['PENDING', 'IN_PROGRESS']).delete()
+
+        seeded_ids = []
+        for letter in letters:
+            task_kwargs = {
+                'job': job,
+                'state_run': state_run,
+                'axis': axis,
+                'state': state,
+                'status': 'PENDING',
+                'firstname': '',
+                'lastname': '',
+                'city': '',
+            }
+            if axis == 'lastname':
+                task_kwargs['lastname'] = letter
+            elif axis == 'firstname':
+                task_kwargs['firstname'] = letter
+            else:
+                task_kwargs['city'] = letter
+
+            task = SearchTask.objects.create(**task_kwargs)
+            res = execute_ssn_lookup.delay(task.id)
+            task.celery_task_id = res.id
+            task.save(update_fields=['celery_task_id'])
+            seeded_ids.append(task.id)
+
+        state_run.update_metrics()
+
+        return Response({
+            'message': f'Smoke test seeded {len(seeded_ids)} tasks for {state}/{axis}.',
+            'job_id': job.id,
+            'state_run_id': state_run.id,
+            'state': state,
+            'axis': axis,
+            'seeded_task_ids': seeded_ids,
+            'cleared_active_tasks': deleted,
+        })
+
+    @action(detail=False, methods=['get'])
+    def worker_health(self, request):
+        """Basic runtime health snapshot for troubleshooting queue execution."""
+        HushraCredentials.restore_ready_credentials()
+
+        status_counts = {
+            key: SearchTask.objects.filter(status=key).count()
+            for key in ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'STOPPED', 'ABORTED', 'TOO_BROAD']
+        }
+
+        latest_tasks = list(
+            SearchTask.objects.order_by('-updated_at')
+            .values('id', 'state', 'axis', 'status', 'error_message', 'updated_at')[:20]
+        )
+
+        return Response({
+            'credentials': {
+                'total': HushraCredentials.objects.count(),
+                'active': HushraCredentials.objects.filter(is_active=True).count(),
+                'inactive': HushraCredentials.objects.filter(is_active=False).count(),
+            },
+            'jobs': {
+                'total': SearchJob.objects.count(),
+                'running': SearchJob.objects.filter(status='RUNNING').count(),
+            },
+            'tasks': status_counts,
+            'latest_tasks': latest_tasks,
+        })
 
 
 # ---------------------------------------------------------------------------
