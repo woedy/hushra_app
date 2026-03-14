@@ -67,10 +67,16 @@ ASGI_APPLICATION = 'core.asgi.application'
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 import dj_database_url
 
+# Prefer PostgreSQL by default. If DATABASE_URL is explicitly provided, it wins.
+POSTGRES_DEFAULT_URL = os.environ.get(
+    'POSTGRES_DEFAULT_URL',
+    'postgres://hushra_user:hushra_pass@localhost:5432/hushra_db'
+)
+
 DATABASES = {
     'default': dj_database_url.config(
-        default='sqlite:///' + str(BASE_DIR / 'db.sqlite3'),
-        conn_max_age=600
+        default=os.environ.get('DATABASE_URL', POSTGRES_DEFAULT_URL),
+        conn_max_age=600,
     )
 }
 
@@ -118,6 +124,12 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    'orchestrate-spider-every-minute': {
+        'task': 'scraper.tasks.orchestrate_spider',
+        'schedule': 60.0,
+    },
+}
 
 
 # Task jitter configuration (used by scraper.tasks.execute_ssn_lookup)
@@ -157,3 +169,4 @@ HUSHRA_NO_CREDENTIAL_RETRY_SECONDS = int(os.environ.get('HUSHRA_NO_CREDENTIAL_RE
 HUSHRA_AUTH_FAILED_RETRY_SECONDS = int(os.environ.get('HUSHRA_AUTH_FAILED_RETRY_SECONDS', 10))
 HUSHRA_RATE_LIMIT_RETRY_SECONDS = int(os.environ.get('HUSHRA_RATE_LIMIT_RETRY_SECONDS', 300))
 HUSHRA_CREDENTIAL_SOFT_LIMIT = int(os.environ.get('HUSHRA_CREDENTIAL_SOFT_LIMIT', 80))
+HUSHRA_AUTH_FAILED_COOLDOWN_HOURS = int(os.environ.get('HUSHRA_AUTH_FAILED_COOLDOWN_HOURS', 2))

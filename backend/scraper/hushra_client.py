@@ -100,7 +100,7 @@ class HushraAPIClient:
                         return "SUCCESS"
                     else:
                         logger.error(f"Login response 200 but no token found: {data}")
-                        return "AUTH_FAILED"
+                        return "PARSE_ERROR"
                 except json.JSONDecodeError:
                     # Log the start of the response to see if it's HTML or binary
                     raw = response.text[:500]

@@ -15,6 +15,7 @@ from .serializers import (
 from .tasks import execute_ssn_lookup, orchestrate_spider
 from .hushra_client import HushraAPIClient
 import django_filters.rest_framework
+from django.core.paginator import Paginator
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +59,7 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
         in_progress = SearchTask.objects.filter(status='IN_PROGRESS').count()
         completed = SearchTask.objects.filter(status='COMPLETED').count()
         failed = SearchTask.objects.filter(status='FAILED').count()
-        min_queue = GlobalSetting.get_value('auto_queue_min', default='500')
+        min_queue = GlobalSetting.get_value('auto_queue_min', default='200')
         states_str = GlobalSetting.get_value('auto_run_states', default='')
         axes_str = GlobalSetting.get_value('auto_run_axes', default='lastname')
         states = [s.strip() for s in states_str.split(',') if s.strip()] if states_str else []
@@ -105,39 +106,186 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
         if HushraCredentials.objects.count() == 0:
             return Response({'error': 'No UUID credentials found. Add UUIDs before starting Auto Run.'}, status=400)
 
-        soft_limit = GlobalSetting.get_value('soft_limit', 80)
+        soft_limit = GlobalSetting.get_value('soft_limit', 100)
         if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
             return Response({'error': 'No active UUID credentials are available right now. Reset the UUID pool or add new UUIDs.'}, status=400)
 
-        orchestrate_spider.delay(seed_anyway=True)
-        return Response({'message': 'Seeding triggered successfully.'})
+        # Run one orchestration cycle inline so the UI immediately shows seeded jobs/tasks,
+        # then rely on worker execution for background lookup processing.
+        result = orchestrate_spider(seed_anyway=True)
+        return Response({'message': f'Seeding triggered successfully. {result}'})
 
     @action(detail=False, methods=['post'])
     def new_session(self, request):
         """
-        Reset the auto-orchestrator for a new sweep session.
-        Deletes all COMPLETED, FAILED, STOPPED prime tasks on the Auto Orchestrator Job
-        so the next tick (or Seed Now) will re-seed a full A-Z sweep from scratch.
+        Hard reset auto-run execution so old tasks can't continue unexpectedly.
+        - disables auto_run
+        - revokes pending/in-progress tasks
+        - pauses active state runs
+        - purges broker queue and clears terminal rows
         """
-        from .models import SearchJob
+        from core.celery import app as celery_app
+
+        GlobalSetting.objects.update_or_create(key='auto_run_enabled', defaults={'value': 'false'})
+
         try:
             job = SearchJob.objects.get(name="Auto Orchestrator Job")
-            deleted_count, _ = job.tasks.filter(
-                status__in=['COMPLETED', 'FAILED', 'STOPPED', 'ABORTED', 'TOO_BROAD']
-            ).delete()
-            # Reset job to RUNNING so it can accept new tasks
+        except SearchJob.DoesNotExist:
+            return Response({'message': 'No existing auto-orchestrator job. Auto Run disabled.', 'deleted': 0, 'cancelled': 0})
+
+        active_qs = job.tasks.filter(status__in=['PENDING', 'IN_PROGRESS'])
+        to_revoke_ids = list(active_qs.exclude(celery_task_id__isnull=True).values_list('celery_task_id', flat=True))
+        cancelled = active_qs.update(status='STOPPED', updated_at=timezone.now())
+
+        revoked = 0
+        for tid in to_revoke_ids:
+            if tid and tid != 'PENDING_COMMIT':
+                celery_app.control.revoke(tid, terminate=True)
+                revoked += 1
+
+        job.state_runs.filter(status='RUNNING').update(status='PAUSED', updated_at=timezone.now())
+        job.status = 'RUNNING'
+        job.save(update_fields=['status'])
+
+        deleted_count, _ = job.tasks.filter(
+            status__in=['COMPLETED', 'FAILED', 'STOPPED', 'ABORTED', 'TOO_BROAD']
+        ).delete()
+
+        with celery_app.connection_or_acquire() as conn:
+            conn.default_channel.queue_purge('celery')
+
+        return Response({
+            'message': (
+                f'New session ready. Auto Run disabled, cancelled {cancelled} active tasks '
+                f'({revoked} revoked), and cleared {deleted_count} terminal tasks.'
+            ),
+            'deleted': deleted_count,
+            'cancelled': cancelled,
+            'revoked': revoked,
+        })
+
+    @action(detail=False, methods=['post'])
+    def smoke_test(self, request):
+        """
+        Minimal manual pipeline: seed a small deterministic batch (default 5)
+        for one state/axis and enqueue workers immediately.
+        Payload (optional): {"state": "CA", "axis": "lastname", "count": 5, "clear_existing": true}
+        """
+        axis = str(request.data.get('axis', 'lastname')).strip().lower()
+        if axis not in {'lastname', 'firstname', 'city'}:
+            return Response({'error': 'axis must be one of lastname, firstname, city'}, status=400)
+
+        raw_count = request.data.get('count', 5)
+        try:
+            count = max(1, min(int(raw_count), 26))
+        except (TypeError, ValueError):
+            return Response({'error': 'count must be an integer between 1 and 26'}, status=400)
+
+        clear_existing = str(request.data.get('clear_existing', 'true')).lower() != 'false'
+
+        state = str(request.data.get('state', '')).strip().upper()
+        if not state:
+            configured_states = GlobalSetting.get_value('auto_run_states', default='')
+            if configured_states:
+                parts = [s.strip().upper() for s in str(configured_states).split(',') if s.strip()]
+                state = parts[0] if parts else ''
+        if not state or len(state) != 2:
+            return Response({'error': 'Provide a valid 2-letter state code.'}, status=400)
+
+        if HushraCredentials.objects.count() == 0:
+            return Response({'error': 'No UUID credentials found. Add UUIDs first.'}, status=400)
+
+        HushraCredentials.restore_ready_credentials()
+        if not HushraCredentials.objects.filter(is_active=True).exists():
+            return Response({'error': 'No active UUID credentials are available. Reset UUID pool first.'}, status=400)
+
+        alphabet = 'abcdefghijklmnopqrstuvwxyz'
+        letters = alphabet[:count]
+
+        job, _ = SearchJob.objects.get_or_create(name='Smoke Test Job', defaults={'status': 'RUNNING'})
+        if job.status == 'STOPPED':
             job.status = 'RUNNING'
             job.save(update_fields=['status'])
 
-            # PURGE CELERY QUEUE
-            # This clears out any "ghost" tasks that are pointing to deleted rows.
-            from core.celery import app as celery_app
-            with celery_app.connection_or_acquire() as conn:
-                conn.default_channel.queue_purge('celery')
+        state_run, _ = StateRun.objects.get_or_create(
+            job=job,
+            state=state,
+            defaults={'status': 'RUNNING', 'axes_enabled': [axis]},
+        )
+        state_run.status = 'RUNNING'
+        state_run.axes_enabled = [axis]
+        state_run.started_at = state_run.started_at or timezone.now()
+        state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
 
-            return Response({'message': f'New session started. Cleared {deleted_count} tasks and purged the queue.', 'deleted': deleted_count})
-        except SearchJob.DoesNotExist:
-            return Response({'message': 'No existing auto-orchestrator job. Ready for first run.', 'deleted': 0})
+        deleted = 0
+        if clear_existing:
+            deleted, _ = state_run.tasks.filter(status__in=['PENDING', 'IN_PROGRESS']).delete()
+
+        seeded_ids = []
+        for letter in letters:
+            task_kwargs = {
+                'job': job,
+                'state_run': state_run,
+                'axis': axis,
+                'state': state,
+                'status': 'PENDING',
+                'firstname': '',
+                'lastname': '',
+                'city': '',
+            }
+            if axis == 'lastname':
+                task_kwargs['lastname'] = letter
+            elif axis == 'firstname':
+                task_kwargs['firstname'] = letter
+            else:
+                task_kwargs['city'] = letter
+
+            task = SearchTask.objects.create(**task_kwargs)
+            res = execute_ssn_lookup.delay(task.id)
+            task.celery_task_id = res.id
+            task.save(update_fields=['celery_task_id'])
+            seeded_ids.append(task.id)
+
+        state_run.update_metrics()
+
+        return Response({
+            'message': f'Smoke test seeded {len(seeded_ids)} tasks for {state}/{axis}.',
+            'job_id': job.id,
+            'state_run_id': state_run.id,
+            'state': state,
+            'axis': axis,
+            'seeded_task_ids': seeded_ids,
+            'cleared_active_tasks': deleted,
+        })
+
+    @action(detail=False, methods=['get'])
+    def worker_health(self, request):
+        """Basic runtime health snapshot for troubleshooting queue execution."""
+        HushraCredentials.restore_ready_credentials()
+
+        status_counts = {
+            key: SearchTask.objects.filter(status=key).count()
+            for key in ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'STOPPED', 'ABORTED', 'TOO_BROAD']
+        }
+
+        latest_tasks = list(
+            SearchTask.objects.order_by('-updated_at')
+            .values('id', 'state', 'axis', 'status', 'error_message', 'updated_at')[:20]
+        )
+
+        return Response({
+            'credentials': {
+                'total': HushraCredentials.objects.count(),
+                'active': HushraCredentials.objects.filter(is_active=True).count(),
+                'inactive': HushraCredentials.objects.filter(is_active=False).count(),
+            },
+            'jobs': {
+                'total': SearchJob.objects.count(),
+                'running': SearchJob.objects.filter(status='RUNNING').count(),
+            },
+            'tasks': status_counts,
+            'latest_tasks': latest_tasks,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -248,28 +396,72 @@ class StateRunViewSet(viewsets.ModelViewSet):
         state_run.save(update_fields=['status'])
         return Response({"message": f"State {state_run.state} resumed."})
 
+    @action(detail=False, methods=['post'])
+    def bulk_control(self, request):
+        """Bulk pause/resume/stop control for multiple state runs."""
+        action_name = str(request.data.get('action', '')).strip().lower()
+        ids = request.data.get('state_run_ids', [])
+        if action_name not in {'pause', 'resume', 'stop'}:
+            return Response({'error': 'action must be one of pause, resume, stop'}, status=400)
+        if not isinstance(ids, list) or not ids:
+            return Response({'error': 'state_run_ids must be a non-empty list'}, status=400)
+
+        runs = list(StateRun.objects.filter(id__in=ids))
+        if not runs:
+            return Response({'error': 'No matching state runs found.'}, status=404)
+
+        results = []
+        for sr in runs:
+            if action_name == 'pause':
+                sr.status = 'PAUSED'
+                sr.save(update_fields=['status', 'updated_at'])
+                results.append({'id': sr.id, 'state': sr.state, 'status': sr.status, 'cancelled': 0, 'revoked': 0})
+            elif action_name == 'resume':
+                sr.status = 'RUNNING'
+                sr.save(update_fields=['status', 'updated_at'])
+                results.append({'id': sr.id, 'state': sr.state, 'status': sr.status, 'cancelled': 0, 'revoked': 0})
+            else:
+                from core.celery import app as celery_app
+                sr.status = 'PAUSED'
+                sr.save(update_fields=['status', 'updated_at'])
+                active_tasks = sr.tasks.filter(status__in=['PENDING', 'IN_PROGRESS'])
+                revoke_ids = list(active_tasks.exclude(celery_task_id__isnull=True).values_list('celery_task_id', flat=True))
+                cancelled = active_tasks.update(status='STOPPED', updated_at=timezone.now())
+                revoked = 0
+                for tid in revoke_ids:
+                    if tid and tid != 'PENDING_COMMIT':
+                        celery_app.control.revoke(tid, terminate=True)
+                        revoked += 1
+                sr.update_metrics()
+                results.append({'id': sr.id, 'state': sr.state, 'status': sr.status, 'cancelled': cancelled, 'revoked': revoked})
+
+        return Response({'message': f'Bulk {action_name} applied to {len(results)} state runs.', 'results': results})
+
     @action(detail=True, methods=['post'])
     def stop(self, request, pk=None):
-        """Stop a state run and revoke all its tasks."""
+        """Stop a state run and revoke all active celery tasks for that state."""
         from core.celery import app as celery_app
         state_run = self.get_object()
-        
-        # Mark state run as stopped
-        state_run.status = 'FAILED'
-        state_run.save(update_fields=['status'])
-        
-        # Stop all active tasks for this state
+
+        state_run.status = 'PAUSED'
+        state_run.save(update_fields=['status', 'updated_at'])
+
         active_tasks = state_run.tasks.filter(status__in=['PENDING', 'IN_PROGRESS'])
-        in_progress_ids = list(active_tasks.filter(status='IN_PROGRESS').values_list('celery_task_id', flat=True))
-        
+        revoke_ids = list(active_tasks.exclude(celery_task_id__isnull=True).values_list('celery_task_id', flat=True))
         count = active_tasks.update(status='STOPPED', updated_at=timezone.now())
-        
-        # Revoke running tasks
-        for tid in in_progress_ids:
-            if tid:
+
+        revoked = 0
+        for tid in revoke_ids:
+            if tid and tid != 'PENDING_COMMIT':
                 celery_app.control.revoke(tid, terminate=True)
-        
-        return Response({"message": f"State {state_run.state} stopped. {count} tasks cancelled."})
+                revoked += 1
+
+        state_run.update_metrics()
+        return Response({
+            "message": f"State {state_run.state} stopped. {count} tasks cancelled ({revoked} revoked).",
+            "cancelled": count,
+            "revoked": revoked,
+        })
 
     @action(detail=True, methods=['post'])
     def refresh_metrics(self, request, pk=None):
@@ -296,6 +488,37 @@ class StateRunViewSet(viewsets.ModelViewSet):
         state_run.completed_at = None
         state_run.save()
         return Response({"message": f"State {state_run.state} reset. Deleted {deleted_count} tasks."})
+
+    @action(detail=True, methods=['get'])
+    def records(self, request, pk=None):
+        """Return paginated PersonRecord rows for this state run."""
+        state_run = self.get_object()
+
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+        except (TypeError, ValueError):
+            page = 1
+
+        try:
+            page_size = int(request.query_params.get('page_size', 25))
+        except (TypeError, ValueError):
+            page_size = 25
+        page_size = min(max(page_size, 1), 100)
+
+        queryset = PersonRecord.objects.filter(task__state_run=state_run).order_by('-created_at', '-id')
+        paginator = Paginator(queryset, page_size)
+        page_obj = paginator.get_page(page)
+        serializer = PersonRecordSerializer(page_obj.object_list, many=True)
+
+        return Response({
+            'count': paginator.count,
+            'page': page_obj.number,
+            'total_pages': paginator.num_pages,
+            'page_size': page_size,
+            'state_run_id': state_run.id,
+            'state': state_run.state,
+            'results': serializer.data,
+        })
 
 
 # ---------------------------------------------------------------------------

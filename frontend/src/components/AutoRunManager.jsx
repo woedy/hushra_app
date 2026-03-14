@@ -20,18 +20,6 @@ function Badge({ status }) {
   };
 
 
-  const resetUuidPool = async () => {
-    setBusy(true);
-    try {
-      const r = await apiFetch('/api/credentials/reset_pool/', { method: 'POST' });
-      const d = await r.json();
-      setLastMsg(d.message || d.error || 'UUID pool reset complete.');
-      await refreshAll();
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <span className={`text-[10px] px-2 py-0.5 rounded-full border font-semibold ${map[status] || map.PENDING}`}>
       {status}
@@ -45,13 +33,20 @@ export default function AutoRunManager() {
   const [credentials, setCredentials] = useState([]);
   const [autoStates, setAutoStates] = useState([]);
   const [autoAxes, setAutoAxes] = useState(['lastname']);
-  const [autoQueueMin, setAutoQueueMin] = useState(500);
+  const [autoQueueMin, setAutoQueueMin] = useState(200);
   const [lastMsg, setLastMsg] = useState('');
   const [busy, setBusy] = useState(false);
   const [stateRunBusy, setStateRunBusy] = useState(null);
+  const [bulkActionBusy, setBulkActionBusy] = useState(false);
+  const [selectedStateRuns, setSelectedStateRuns] = useState([]);
   const [uuidBlob, setUuidBlob] = useState('');
+  const [recordsPanel, setRecordsPanel] = useState({ open: false, loading: false, stateRun: null, page: 1, totalPages: 1, count: 0, rows: [] });
 
-  const credentialsReady = status?.credentials_ready;
+  const activeUuidCount = useMemo(() => credentials.filter(c => c.is_active).length, [credentials]);
+
+
+  const hasLoadedStatus = status !== null;
+  const credentialsReady = status?.credentials_ready ?? activeUuidCount > 0;
 
   const loadSettings = useCallback(async () => {
     const r = await apiFetch('/api/settings/');
@@ -59,7 +54,7 @@ export default function AutoRunManager() {
     const data = await r.json();
     const rows = data.results || data;
     rows.forEach(item => {
-      if (item.key === 'auto_queue_min') setAutoQueueMin(parseInt(item.value, 10) || 500);
+      if (item.key === 'auto_queue_min') setAutoQueueMin(parseInt(item.value, 10) || 200);
       if (item.key === 'auto_run_states') setAutoStates(item.value ? item.value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : []);
       if (item.key === 'auto_run_axes') setAutoAxes(item.value ? item.value.split(',').map(s => s.trim()).filter(Boolean) : ['lastname']);
     });
@@ -70,7 +65,7 @@ export default function AutoRunManager() {
     if (!r.ok) return;
     const data = await r.json();
     setStatus(data);
-    setAutoQueueMin(data.min_queue ?? 500);
+    setAutoQueueMin(data.min_queue ?? 200);
   }, []);
 
   const loadStateRuns = useCallback(async () => {
@@ -101,7 +96,6 @@ export default function AutoRunManager() {
     return () => clearInterval(id);
   }, [refreshAll, refreshLive]);
 
-  const activeUuidCount = useMemo(() => credentials.filter(c => c.is_active).length, [credentials]);
 
   const sortedSelectedStates = useMemo(() => [...autoStates].sort(), [autoStates]);
 
@@ -127,14 +121,44 @@ export default function AutoRunManager() {
     return { ...totals, avgTpm, avgRpt, primeProgress };
   }, [stateRuns]);
 
+  const persistConfig = useCallback(async () => {
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_queue_min', value: autoQueueMin }) });
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_states', value: autoStates.join(',') }) });
+    await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_axes', value: autoAxes.join(',') }) });
+  }, [autoAxes, autoQueueMin, autoStates]);
+
   const saveConfig = async () => {
     setBusy(true);
     setLastMsg('');
     try {
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_queue_min', value: autoQueueMin }) });
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_states', value: autoStates.join(',') }) });
-      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_axes', value: autoAxes.join(',') }) });
+      await persistConfig();
       setLastMsg('Configuration saved.');
+      await refreshAll();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyFastestSafePreset = async () => {
+    setBusy(true);
+    setLastMsg('');
+    try {
+      const nextStates = ALL_STATES;
+      const nextAxes = ['lastname'];
+      const nextQueueMin = 200;
+
+      setAutoStates(nextStates);
+      setAutoAxes(nextAxes);
+      setAutoQueueMin(nextQueueMin);
+
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_queue_min', value: nextQueueMin }) });
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_states', value: nextStates.join(',') }) });
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_axes', value: nextAxes.join(',') }) });
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'auto_state_order_mode', value: 'round_robin' }) });
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'soft_limit', value: 100 }) });
+      await apiFetch('/api/settings/set_value/', { method: 'POST', body: JSON.stringify({ key: 'use_proxy', value: false }) });
+
+      setLastMsg('Applied Fastest Safe preset: all states, lastname axis, round-robin state order, queue min 200, soft limit 100, proxy off.');
       await refreshAll();
     } finally {
       setBusy(false);
@@ -150,6 +174,7 @@ export default function AutoRunManager() {
     setBusy(true);
     setLastMsg('');
     try {
+      await persistConfig();
       const r = await apiFetch('/api/settings/toggle/', { method: 'POST', body: JSON.stringify({ key: 'auto_run_enabled' }) });
       const d = await r.json();
       const nowEnabled = d.value === true || d.value === 'true';
@@ -171,6 +196,7 @@ export default function AutoRunManager() {
     }
     setBusy(true);
     try {
+      await persistConfig();
       const r = await apiFetch('/api/settings/seed_now/', { method: 'POST' });
       const d = await r.json();
       setLastMsg(r.ok ? d.message : (d.error || 'Seed failed.'));
@@ -196,10 +222,64 @@ export default function AutoRunManager() {
   const runStateAction = async (id, action) => {
     setStateRunBusy(id);
     try {
-      await apiFetch(`/api/state-runs/${id}/${action}/`, { method: 'POST' });
+      const r = await apiFetch(`/api/state-runs/${id}/${action}/`, { method: 'POST' });
+      const d = await r.json();
+      setLastMsg(d.message || d.error || `State action ${action} complete.`);
       await refreshAll();
     } finally {
       setStateRunBusy(null);
+    }
+  };
+
+  const toggleStateRunSelection = (id) => {
+    setSelectedStateRuns(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const bulkStateAction = async (action) => {
+    if (selectedStateRuns.length === 0) {
+      setLastMsg('Select at least one state run first.');
+      return;
+    }
+    setBulkActionBusy(true);
+    try {
+      const r = await apiFetch('/api/state-runs/bulk_control/', {
+        method: 'POST',
+        body: JSON.stringify({ action, state_run_ids: selectedStateRuns }),
+      });
+      const d = await r.json();
+      setLastMsg(d.message || d.error || `Bulk ${action} complete.`);
+      if (r.ok) setSelectedStateRuns([]);
+      await refreshAll();
+    } finally {
+      setBulkActionBusy(false);
+    }
+  };
+
+  const closeRecordsPanel = () => {
+    setRecordsPanel({ open: false, loading: false, stateRun: null, page: 1, totalPages: 1, count: 0, rows: [] });
+  };
+
+  const openStateRunRecords = async (stateRun, page = 1) => {
+    setRecordsPanel(prev => ({ ...prev, open: true, loading: true, stateRun }));
+    try {
+      const r = await apiFetch(`/api/state-runs/${stateRun.id}/records/?page=${page}&page_size=25`);
+      const d = await r.json();
+      if (!r.ok) {
+        setLastMsg(d.error || 'Unable to load records for this state run.');
+        setRecordsPanel(prev => ({ ...prev, loading: false }));
+        return;
+      }
+      setRecordsPanel({
+        open: true,
+        loading: false,
+        stateRun,
+        page: d.page || 1,
+        totalPages: d.total_pages || 1,
+        count: d.count || 0,
+        rows: d.results || [],
+      });
+    } finally {
+      setRecordsPanel(prev => ({ ...prev, loading: false }));
     }
   };
 
@@ -235,7 +315,7 @@ export default function AutoRunManager() {
 
   return (
     <div className="space-y-6">
-      {!credentialsReady && (
+      {hasLoadedStatus && !credentialsReady && (
         <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4">
           <p className="text-sm font-bold text-red-300">Auto Run is blocked</p>
           <p className="text-xs text-red-200/90 mt-1">You need at least one active UUID credential before Auto Run tasks can start. If UUIDs are exhausted, use Reset UUID Pool below.</p>
@@ -265,6 +345,8 @@ export default function AutoRunManager() {
               className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold">Seed Now</button>
             <button onClick={saveConfig} disabled={busy}
               className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold">Save Config</button>
+            <button onClick={applyFastestSafePreset} disabled={busy}
+              className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold">Apply Fastest Safe</button>
             <button onClick={resetSession} disabled={busy}
               className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold">New Session Reset</button>
           </div>
@@ -380,6 +462,17 @@ export default function AutoRunManager() {
           <h3 className="font-semibold text-gray-100">Per-State Runs</h3>
           <p className="text-xs text-gray-500">Monitor + control each selected state independently.</p>
         </div>
+        <div className="flex flex-wrap gap-2 mb-3">
+          <button disabled={bulkActionBusy || selectedStateRuns.length === 0} onClick={() => bulkStateAction('pause')}
+            className="text-xs px-3 py-1.5 rounded border border-amber-500/40 text-amber-300 disabled:opacity-40">Pause Selected</button>
+          <button disabled={bulkActionBusy || selectedStateRuns.length === 0} onClick={() => bulkStateAction('resume')}
+            className="text-xs px-3 py-1.5 rounded border border-blue-500/40 text-blue-300 disabled:opacity-40">Resume Selected</button>
+          <button disabled={bulkActionBusy || selectedStateRuns.length === 0} onClick={() => bulkStateAction('stop')}
+            className="text-xs px-3 py-1.5 rounded border border-red-500/40 text-red-300 disabled:opacity-40">Stop Selected</button>
+          <button disabled={bulkActionBusy || selectedStateRuns.length === 0} onClick={() => setSelectedStateRuns([])}
+            className="text-xs px-3 py-1.5 rounded border border-gray-600 text-gray-300 disabled:opacity-40">Clear Selection</button>
+          <p className="text-xs text-gray-500 self-center">Selected: {selectedStateRuns.length}</p>
+        </div>
         {stateRuns.length === 0 ? (
           <p className="text-sm text-gray-500">No state runs yet.</p>
         ) : (
@@ -387,23 +480,16 @@ export default function AutoRunManager() {
             {stateRuns.map(sr => {
               const progress = sr.total_primes > 0 ? Math.min((sr.primes_completed / sr.total_primes) * 100, 100) : 0;
               const busyRow = stateRunBusy === sr.id;
-            
-  const resetUuidPool = async () => {
-    setBusy(true);
-    try {
-      const r = await apiFetch('/api/credentials/reset_pool/', { method: 'POST' });
-      const d = await r.json();
-      setLastMsg(d.message || d.error || 'UUID pool reset complete.');
-      await refreshAll();
-    } finally {
-      setBusy(false);
-    }
-  };
+              const selected = selectedStateRuns.includes(sr.id);
 
-  return (
-                <div key={sr.id} className="bg-gray-900 border border-gray-700 rounded-lg p-3 space-y-2">
+              return (
+                <div key={sr.id} className={`bg-gray-900 border rounded-lg p-3 space-y-2 ${selected ? 'border-blue-400' : 'border-gray-700'}`}>
                   <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2"><span className="font-mono font-bold">{sr.state}</span><Badge status={sr.status} /></div>
+                    <div className="flex items-center gap-2">
+                      <input type="checkbox" checked={selected} onChange={() => toggleStateRunSelection(sr.id)} className="accent-blue-500" />
+                      <span className="font-mono font-bold">{sr.state}</span>
+                      <Badge status={sr.status} />
+                    </div>
                     <span className="text-[10px] text-gray-500">{sr.tasks_completed}/{sr.total_tasks || 0} tasks</span>
                   </div>
                   <div className="w-full h-2 rounded-full bg-gray-800 overflow-hidden"><div className="h-full bg-blue-500" style={{ width: `${progress}%` }} /></div>
@@ -412,6 +498,7 @@ export default function AutoRunManager() {
                     <button disabled={busyRow || sr.status !== 'RUNNING'} onClick={() => runStateAction(sr.id, 'pause')} className="text-[10px] px-2 py-1 border border-amber-500/30 text-amber-300 rounded disabled:opacity-40">Pause</button>
                     <button disabled={busyRow || sr.status !== 'PAUSED'} onClick={() => runStateAction(sr.id, 'resume')} className="text-[10px] px-2 py-1 border border-blue-500/30 text-blue-300 rounded disabled:opacity-40">Resume</button>
                     <button disabled={busyRow || ['COMPLETED', 'FAILED'].includes(sr.status)} onClick={() => runStateAction(sr.id, 'stop')} className="text-[10px] px-2 py-1 border border-red-500/30 text-red-300 rounded disabled:opacity-40">Stop</button>
+                    <button disabled={busyRow} onClick={() => openStateRunRecords(sr, 1)} className="text-[10px] px-2 py-1 border border-cyan-500/30 text-cyan-300 rounded disabled:opacity-40">View Data</button>
                     <button disabled={busyRow} onClick={() => runStateAction(sr.id, 'refresh_metrics')} className="text-[10px] px-2 py-1 border border-gray-600 text-gray-300 rounded ml-auto disabled:opacity-40">Refresh</button>
                   </div>
                 </div>
@@ -420,6 +507,68 @@ export default function AutoRunManager() {
           </div>
         )}
       </div>
+
+      {recordsPanel.open && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-6xl bg-gray-900 border border-gray-700 rounded-xl shadow-xl">
+            <div className="flex items-center justify-between p-4 border-b border-gray-700">
+              <div>
+                <h3 className="text-lg font-bold text-cyan-300">State {recordsPanel.stateRun?.state} Returned Data</h3>
+                <p className="text-xs text-gray-400">Total records: {recordsPanel.count} • Page {recordsPanel.page}/{recordsPanel.totalPages}</p>
+              </div>
+              <button onClick={closeRecordsPanel} className="text-sm px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600">Close</button>
+            </div>
+
+            <div className="p-4 max-h-[70vh] overflow-auto">
+              {recordsPanel.loading ? (
+                <p className="text-sm text-gray-400">Loading records...</p>
+              ) : recordsPanel.rows.length === 0 ? (
+                <p className="text-sm text-gray-400">No records found for this state run yet.</p>
+              ) : (
+                <table className="min-w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-gray-400 border-b border-gray-700">
+                      <th className="py-2 pr-3">Name</th>
+                      <th className="py-2 pr-3">SSN</th>
+                      <th className="py-2 pr-3">DOB</th>
+                      <th className="py-2 pr-3">Address</th>
+                      <th className="py-2 pr-3">City</th>
+                      <th className="py-2 pr-3">State</th>
+                      <th className="py-2 pr-3">ZIP</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recordsPanel.rows.map((row) => (
+                      <tr key={row.id} className="border-b border-gray-800 text-gray-200">
+                        <td className="py-2 pr-3">{[row.firstname, row.middlename, row.lastname].filter(Boolean).join(' ') || '—'}</td>
+                        <td className="py-2 pr-3">{row.ssn || '—'}</td>
+                        <td className="py-2 pr-3">{row.dob || '—'}</td>
+                        <td className="py-2 pr-3">{row.address || '—'}</td>
+                        <td className="py-2 pr-3">{row.city || '—'}</td>
+                        <td className="py-2 pr-3">{row.state || '—'}</td>
+                        <td className="py-2 pr-3">{row.zip_code || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-gray-700 flex items-center justify-between">
+              <button
+                disabled={recordsPanel.loading || recordsPanel.page <= 1}
+                onClick={() => openStateRunRecords(recordsPanel.stateRun, recordsPanel.page - 1)}
+                className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-sm"
+              >Prev</button>
+              <button
+                disabled={recordsPanel.loading || recordsPanel.page >= recordsPanel.totalPages}
+                onClick={() => openStateRunRecords(recordsPanel.stateRun, recordsPanel.page + 1)}
+                className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-sm"
+              >Next</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

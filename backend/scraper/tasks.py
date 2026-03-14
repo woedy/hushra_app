@@ -24,6 +24,40 @@ LASTNAME_DEPTH_THRESHOLD = getattr(settings, "HUSHRA_LASTNAME_DEPTH_THRESHOLD", 
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
 
+def _select_state_iteration_order(states):
+    """
+    Decide how states are iterated for this orchestrator tick.
+
+    Modes:
+      - round_robin (default): rotates the starting state every tick via GlobalSetting cursor
+      - random: shuffled each tick
+    """
+    if not states:
+        return []
+
+    mode = str(GlobalSetting.get_value('auto_state_order_mode', default='round_robin')).strip().lower()
+    normalized = list(dict.fromkeys([s.upper() for s in states if s]))
+    if not normalized:
+        return []
+
+    if mode == 'random':
+        shuffled = normalized[:]
+        random.shuffle(shuffled)
+        return shuffled
+
+    # Default mode: round-robin with persisted cursor.
+    try:
+        cursor = int(GlobalSetting.get_value('auto_state_cursor', default=0))
+    except (TypeError, ValueError):
+        cursor = 0
+
+    cursor = cursor % len(normalized)
+    ordered = normalized[cursor:] + normalized[:cursor]
+    next_cursor = (cursor + 1) % len(normalized)
+    GlobalSetting.objects.update_or_create(key='auto_state_cursor', defaults={'value': str(next_cursor)})
+    return ordered
+
+
 def _get_client_with_cached_token(credential):
     """
     Returns an authenticated HushraAPIClient, reusing a cached Redis token
@@ -35,7 +69,7 @@ def _get_client_with_cached_token(credential):
     cached_token = cache.get(cache_key)
 
     # Check if we should use proxies at all
-    use_proxy = GlobalSetting.get_value('use_proxy', default=True)
+    use_proxy = GlobalSetting.get_value('use_proxy', default=False)
 
     # Try up to 3 times to get an authenticated client (in case of bad proxies)
     max_proxy_retries = 3 if use_proxy else 1
@@ -193,6 +227,15 @@ def execute_ssn_lookup(self, task_id):
             task.save(update_fields=['status'])
         return
 
+    # Respect per-state run controls as a hard gate.
+    if task.state_run and task.state_run.status in ['PAUSED', 'FAILED', 'COMPLETED']:
+        logger.info(
+            f"Task {task_id} blocked because state_run={task.state_run_id} is {task.state_run.status}."
+        )
+        task.status = 'STOPPED'
+        task.save(update_fields=['status', 'updated_at'])
+        return
+
     # 1. Claim task atomically so duplicate deliveries don't re-run the same row
     claimed = SearchTask.objects.filter(id=task.id, status='PENDING').update(
         status='IN_PROGRESS',
@@ -208,8 +251,22 @@ def execute_ssn_lookup(self, task_id):
     logger.info(f"Task {task_id} [{task.axis}] sleeping {delay:.2f}s jitter.")
     time.sleep(delay)
 
+    # Re-check stop/pause flags after jitter before any network call.
+    task.refresh_from_db(fields=['status', 'state_run_id', 'job_id'])
+    if task.status == 'STOPPED' or task.job.status == 'STOPPED':
+        logger.info(f"Task {task_id} stopped during jitter phase.")
+        if task.status != 'STOPPED':
+            task.status = 'STOPPED'
+            task.save(update_fields=['status', 'updated_at'])
+        return
+    if task.state_run and task.state_run.status in ['PAUSED', 'FAILED', 'COMPLETED']:
+        logger.info(f"Task {task_id} halted because state_run moved to {task.state_run.status}.")
+        task.status = 'STOPPED'
+        task.save(update_fields=['status', 'updated_at'])
+        return
+
     # 3. Pull a healthy credential (under dynamic soft request limit)
-    soft_limit = GlobalSetting.get_value('soft_limit', 80)
+    soft_limit = GlobalSetting.get_value('soft_limit', 100)
     credential = HushraCredentials.get_available_credential(soft_limit=soft_limit)
     if not credential:
         logger.warning("No active Hushra credentials available. Retrying in 5 min.")
@@ -223,10 +280,17 @@ def execute_ssn_lookup(self, task_id):
 
     if client is None:
         if login_err == "AUTH_FAILED":
-            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}... Marking exhausted.")
+            logger.error(f"AUTH_FAILED for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
-            credential.mark_rate_limited(hours=24)
-            raise self.retry(countdown=getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10))
+            auth_retry_delay = getattr(settings, "HUSHRA_AUTH_FAILED_RETRY_SECONDS", 10)
+            # Avoid disabling a UUID on the first auth blip; only cool it down after repeated failures.
+            if self.request.retries >= 2:
+                auth_cooldown = getattr(settings, "HUSHRA_AUTH_FAILED_COOLDOWN_HOURS", 2)
+                credential.mark_rate_limited(hours=auth_cooldown)
+                logger.error(
+                    f"AUTH_FAILED repeated for UUID {credential.uuid[:8]}... applying cooldown for {auth_cooldown}h"
+                )
+            raise self.retry(countdown=auth_retry_delay)
         elif login_err == "RATE_LIMITED":
             logger.warning(f"RATE_LIMITED during login for UUID {credential.uuid[:8]}...")
             cache.delete(cache_key)
@@ -474,7 +538,7 @@ def orchestrate_spider(seed_anyway=False):
         if not seed_anyway and str(enabled).lower() != 'true':
             return "Auto Run is disabled."
 
-        min_queue = int(GlobalSetting.get_value('auto_queue_min', default=500))
+        min_queue = int(GlobalSetting.get_value('auto_queue_min', default=200))
 
         # How many pending tasks do we have?
         pending_count = SearchTask.objects.filter(status__in=['PENDING', 'IN_PROGRESS']).count()
@@ -504,7 +568,7 @@ def orchestrate_spider(seed_anyway=False):
         if HushraCredentials.objects.count() == 0:
             return "No UUID credentials configured. Add UUIDs before running Auto Run."
 
-        soft_limit = GlobalSetting.get_value('soft_limit', 80)
+        soft_limit = GlobalSetting.get_value('soft_limit', 100)
         if not HushraCredentials.has_usable_credentials(soft_limit=soft_limit):
             return "No usable UUID credentials available. Reset UUID pool or increase soft limit."
 
@@ -518,9 +582,10 @@ def orchestrate_spider(seed_anyway=False):
         seeded = 0
         state_runs = {}
 
-        # We iterate over states and axes, looking for A-Z primes that don't exist yet
-        for state in states:
-            normalized_state = state.upper()
+        ordered_states = _select_state_iteration_order(states)
+
+        # Iterate states in configured order mode for fairer multi-state coverage.
+        for normalized_state in ordered_states:
             state_run, _ = StateRun.objects.get_or_create(
                 job=job,
                 state=normalized_state,
@@ -529,8 +594,21 @@ def orchestrate_spider(seed_anyway=False):
                     'axes_enabled': axes,
                 },
             )
-            if state_run.status in ['COMPLETED', 'FAILED']:
-                state_run.status = 'RUNNING'
+            # Respect explicit pause/stop controls for each state run.
+            if state_run.status in ['PAUSED', 'FAILED']:
+                logger.info(
+                    f"Orchestrator: skipping state {normalized_state} because state_run={state_run.id} is {state_run.status}."
+                )
+                continue
+
+            # Allow completed states to be resumed only by setting them RUNNING explicitly.
+            if state_run.status == 'COMPLETED':
+                logger.info(
+                    f"Orchestrator: state {normalized_state} already completed (state_run={state_run.id}), skipping reseed."
+                )
+                continue
+
+            state_run.status = 'RUNNING'
             state_run.axes_enabled = axes
             state_run.started_at = state_run.started_at or timezone.now()
             state_run.save(update_fields=['status', 'axes_enabled', 'started_at', 'updated_at'])
@@ -599,7 +677,7 @@ def orchestrate_spider(seed_anyway=False):
         for state_run in state_runs.values():
             state_run.update_metrics()
 
-        return f"Orchestrator: Queued {seeded} new prime tasks across {len(states)} states."
+        return f"Orchestrator: Queued {seeded} new prime tasks across {len(ordered_states)} states."
 
     finally:
         # Release the lock
