@@ -1,6 +1,7 @@
 import random
 import time
 import logging
+import string
 import requests
 from django.conf import settings
 from django.core.cache import cache
@@ -22,6 +23,7 @@ LASTNAME_DEPTH_THRESHOLD = getattr(settings, "HUSHRA_LASTNAME_DEPTH_THRESHOLD", 
 
 # Alphabet for prefix expansion
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+CHARS = string.ascii_lowercase + string.digits
 
 
 def _select_state_iteration_order(states):
@@ -682,3 +684,51 @@ def orchestrate_spider(seed_anyway=False):
     finally:
         # Release the lock
         cache.delete(lock_id)
+
+
+def generate_username(length=8):
+    return ''.join(random.choice(CHARS) for _ in range(length))
+
+
+@shared_task(bind=True)
+def generate_uuids_task(self, count):
+    """
+    Background task to generate new Hushra UUIDs by registering accounts.
+    Uses proxy rotation and randomized delays to avoid detection.
+    """
+    logger.info(f"Starting generation of {count} UUIDs.")
+    successful = 0
+    
+    use_proxy = GlobalSetting.get_value('use_proxy', default=False)
+    
+    for i in range(count):
+        # 1. Randomized delay to mimic human behavior
+        if i > 0:
+            delay = random.uniform(5.0, 15.0)
+            logger.info(f"Sleeping {delay:.2f}s before next registration.")
+            time.sleep(delay)
+
+        # 2. Get a proxy if enabled
+        proxy_url = None
+        if use_proxy:
+            proxy_url = Proxy.get_random_active()
+
+        # 3. Attempt registration
+        client = HushraAPIClient(proxy=proxy_url)
+        username = generate_username()
+        
+        logger.info(f"Attempting registration for {username} (Attempt {i+1}/{count}).")
+        result = client.register_account(username)
+        
+        if result and 'uuid' in result:
+            uuid_val = result['uuid']
+            HushraCredentials.objects.create(uuid=uuid_val, is_active=True)
+            successful += 1
+            logger.info(f"Successfully generated and saved UUID: {uuid_val[:8]}...")
+        else:
+            logger.error(f"Failed to generate UUID for {username}.")
+
+        # Update progress? Maybe later with WebSockets
+        
+    logger.info(f"UUID Generation completed: {successful}/{count} successful.")
+    return f"Generated {successful} UUIDs."

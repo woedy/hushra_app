@@ -12,11 +12,19 @@ from .serializers import (
     HushraCredentialsSerializer, SearchJobSerializer, SearchTaskSerializer,
     PersonRecordSerializer, ProxySerializer, GlobalSettingSerializer, StateRunSerializer
 )
-from .tasks import execute_ssn_lookup, orchestrate_spider
+from .tasks import execute_ssn_lookup, orchestrate_spider, generate_uuids_task
 from .hushra_client import HushraAPIClient
 import django_filters.rest_framework
 from django.core.paginator import Paginator
+from rest_framework.pagination import PageNumberPagination
 
+
+# ---------------------------------------------------------------------------
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
 
 # ---------------------------------------------------------------------------
 
@@ -293,6 +301,21 @@ class GlobalSettingViewSet(viewsets.ModelViewSet):
 class HushraCredentialsViewSet(viewsets.ModelViewSet):
     queryset = HushraCredentials.objects.all().order_by('-updated_at')
     serializer_class = HushraCredentialsSerializer
+    pagination_class = StandardResultsSetPagination
+
+    @action(detail=False, methods=['post'])
+    def generate(self, request):
+        count = request.data.get('count', 1)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid count"}, status=400)
+            
+        if count <= 0 or count > 500:
+            return Response({"error": "Count must be between 1 and 500"}, status=400)
+            
+        generate_uuids_task.delay(count)
+        return Response({"status": "Generation started", "count": count})
 
     @action(detail=False, methods=['post'])
     def bulk_add(self, request):
@@ -528,6 +551,7 @@ class StateRunViewSet(viewsets.ModelViewSet):
 class SearchJobViewSet(viewsets.ModelViewSet):
     queryset = SearchJob.objects.all().order_by('-created_at')
     serializer_class = SearchJobSerializer
+    pagination_class = StandardResultsSetPagination
 
     @action(detail=False, methods=['post'])
     def create_batch(self, request):
@@ -703,6 +727,7 @@ class SearchJobViewSet(viewsets.ModelViewSet):
 class SearchTaskViewSet(viewsets.ModelViewSet):
     queryset = SearchTask.objects.all().order_by('-created_at')
     serializer_class = SearchTaskSerializer
+    pagination_class = StandardResultsSetPagination
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
     filterset_fields = ['job', 'status', 'state']
 
@@ -722,6 +747,7 @@ class SearchTaskViewSet(viewsets.ModelViewSet):
 class PersonRecordViewSet(viewsets.ModelViewSet):
     queryset = PersonRecord.objects.all().order_by('-created_at')
     serializer_class = PersonRecordSerializer
+    pagination_class = StandardResultsSetPagination
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
     filterset_fields = ['task', 'state']
 

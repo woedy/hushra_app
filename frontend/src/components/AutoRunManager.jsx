@@ -40,6 +40,8 @@ export default function AutoRunManager() {
   const [bulkActionBusy, setBulkActionBusy] = useState(false);
   const [selectedStateRuns, setSelectedStateRuns] = useState([]);
   const [uuidBlob, setUuidBlob] = useState('');
+  const [genCount, setGenCount] = useState(1);
+  const [isGenerating, setIsGenerating] = useState(false);
   const [recordsPanel, setRecordsPanel] = useState({ open: false, loading: false, stateRun: null, page: 1, totalPages: 1, count: 0, rows: [] });
 
   const activeUuidCount = useMemo(() => credentials.filter(c => c.is_active).length, [credentials]);
@@ -300,6 +302,27 @@ export default function AutoRunManager() {
     }
   };
 
+  const handleGenerateUUIDs = async () => {
+    if (isGenerating) return;
+    setIsGenerating(true);
+    setLastMsg(`Starting generation of ${genCount} UUIDs...`);
+    try {
+      const r = await apiFetch('/api/credentials/generate/', {
+        method: 'POST',
+        body: JSON.stringify({ count: genCount })
+      });
+      if (r.ok) {
+        setLastMsg(`Success: Background generation of ${genCount} UUIDs started.`);
+      } else {
+        const err = await r.json();
+        setLastMsg(`Error: ${err.error || 'Failed to start generation'}`);
+      }
+    } catch (err) {
+      setLastMsg(`Connection error: ${err.message}`);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
 
   const resetUuidPool = async () => {
     setBusy(true);
@@ -418,6 +441,26 @@ export default function AutoRunManager() {
             <p>Active UUIDs: <span className="font-bold">{status?.active_credentials ?? activeUuidCount}</span></p>
             <p>Active Available UUIDs: <span className="font-bold">{status?.usable_credentials ?? 0}</span></p>
           </div>
+          
+          <div className="flex border border-gray-700 rounded overflow-hidden">
+            <input 
+              type="number" 
+              min="1" 
+              max="500" 
+              value={genCount} 
+              onChange={(e) => setGenCount(parseInt(e.target.value) || 1)}
+              className="w-full bg-gray-900 text-gray-300 text-xs px-2 py-2 outline-none border-r border-gray-700 font-bold"
+              placeholder="Qty"
+            />
+            <button 
+              onClick={handleGenerateUUIDs}
+              disabled={isGenerating || busy}
+              className={`text-xs font-bold px-4 py-2 uppercase whitespace-nowrap ${isGenerating ? 'bg-gray-800 text-gray-600' : 'bg-emerald-900 text-emerald-400 hover:bg-emerald-800'}`}
+            >
+              {isGenerating ? 'Wait...' : 'Generate'}
+            </button>
+          </div>
+
           <textarea value={uuidBlob} onChange={e => setUuidBlob(e.target.value)}
             className="w-full h-28 bg-gray-900 border border-gray-700 rounded p-2 text-xs"
             placeholder="Paste UUIDs, one per line" />

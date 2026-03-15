@@ -113,6 +113,8 @@ export default function Dashboard() {
 
   // ── accounts tab ──────────────────────────────────────────────────────
   const [credentials, setCredentials] = useState([]);
+  const [genCount, setGenCount] = useState(1);
+  const [isGenerating, setIsGenerating] = useState(false);
   const [proxies, setProxies] = useState([]);
   const [uuidBlob, setUuidBlob] = useState('');
   const [proxyBlob, setProxyBlob] = useState('');
@@ -428,6 +430,27 @@ export default function Dashboard() {
     if (window.confirm("Delete this credential?")) {
       await apiFetch(`/api/credentials/${id}/`, { method: 'DELETE' });
       setCredentials(c => c.filter(x => x.id !== id));
+    }
+  };
+
+  const handleGenerateUUIDs = async () => {
+    if (isGenerating) return;
+    setIsGenerating(true);
+    try {
+      const r = await apiFetch('/api/credentials/generate/', {
+        method: 'POST',
+        body: JSON.stringify({ count: genCount })
+      });
+      if (r.ok) {
+        alert(`Started generating ${genCount} UUIDs in the background.`);
+      } else {
+        const err = await r.json();
+        alert(`Error: ${err.error || 'Failed to start generation'}`);
+      }
+    } catch (err) {
+      alert(`Error connection: ${err.message}`);
+    } finally {
+      setIsGenerating(false);
     }
   };
 
@@ -1039,7 +1062,29 @@ export default function Dashboard() {
             <>
               <div className="px-6 py-4 border-b border-gray-700 flex justify-between items-center bg-gray-800/90 backdrop-blur sticky top-0 z-10">
                 <h2 className="font-bold text-lg text-amber-500">{accountsTab === 'uuids' ? 'UUID Infrastructure' : 'Proxy Network'}</h2>
-                <button onClick={fetchAccounts} className="text-[10px] font-bold text-gray-500 hover:text-white uppercase">Force Sync</button>
+                <div className="flex items-center gap-3">
+                  {accountsTab === 'uuids' && (
+                    <div className="flex border border-gray-700 rounded overflow-hidden">
+                      <input 
+                        type="number" 
+                        min="1" 
+                        max="500" 
+                        value={genCount} 
+                        onChange={(e) => setGenCount(parseInt(e.target.value) || 1)}
+                        className="w-16 bg-gray-900 text-gray-300 text-[10px] px-2 py-1 outline-none border-r border-gray-700 font-bold"
+                        placeholder="Qty"
+                      />
+                      <button 
+                        onClick={handleGenerateUUIDs}
+                        disabled={isGenerating}
+                        className={`text-[10px] font-bold px-3 py-1 uppercase ${isGenerating ? 'bg-gray-800 text-gray-600' : 'bg-emerald-900/40 text-emerald-400 hover:bg-emerald-800'}`}
+                      >
+                        {isGenerating ? 'Firing...' : 'Generate'}
+                      </button>
+                    </div>
+                  )}
+                  <button onClick={fetchAccounts} className="text-[10px] font-bold text-gray-500 hover:text-white uppercase transition-colors">Force Sync</button>
+                </div>
               </div>
               <div className="overflow-y-auto flex-1 custom-scrollbar">
                 {accountsTab === 'uuids' ? (

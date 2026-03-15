@@ -3,6 +3,9 @@ import json
 import logging
 import random
 import time
+from typing import Optional, Dict, List
+import string
+from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
 
@@ -162,3 +165,54 @@ class HushraAPIClient:
 
         logger.warning(f"Hushra lookup unsuccessful for '{firstname} {lastname}' city='{city}' state='{state}'. Response: {data}")
         return []
+
+    def register_account(self, username: str, proxy: Optional[str] = None) -> Optional[dict]:
+        """
+        Register a new account on hushra.me to obtain a fresh UUID.
+        Uses curl_cffi to impersonate a browser and bypass stealth protections.
+        Returns the response JSON (containing 'uuid') or None.
+        """
+        url = "https://api.hushra.me/api/v1/auth/registration"
+        payload = {"username": username}
+        
+        # Build headers similar to generator.py
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": self._accept_lang,
+            "Content-Type": "application/json",
+            "Origin": "https://hushra.me",
+            "Referer": "https://hushra.me/login",
+            "User-Agent": self._ua,
+            "Sec-Ch-Ua": self._sec_ch_ua,
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+        }
+
+        proxies = None
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+        elif self._proxy:
+            proxies = {"http": self._proxy, "https": self._proxy}
+
+        try:
+            # impersonate="chrome110" helps bypass Cloudflare/TLS fingerprinting
+            response = curl_requests.post(
+                url, 
+                json=payload, 
+                headers=headers, 
+                impersonate="chrome110",
+                proxies=proxies,
+                timeout=20
+            )
+            
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                logger.error(f"Registration failed for {username}: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Error during account registration for {username}: {str(e)}")
+            return None
